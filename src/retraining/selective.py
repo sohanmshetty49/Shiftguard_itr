@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+from joblib import Parallel, delayed
 from sklearn.metrics import mean_absolute_error
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -314,8 +315,113 @@ def compute_recovery_time(
     return -1
 
 
-def run_retraining_experiment(pair_name: str) -> pd.DataFrame | None:
-    """Run all 4 strategies on detected shifts for one pair."""
+def _process_one_shift(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    pair_params: dict[str, Any],
+    base_model: xgb.XGBRegressor,
+    shift_row: pd.Series,
+) -> dict[str, Any] | None:
+    """Run all 5 retraining strategies for a single shift.
+
+    Profiling `run_retraining_experiment` with cProfile showed that >98% of
+    wall-clock time is spent inside XGBoost's own `fit()` (retraining from
+    scratch for the "full", "weighted", and "adaptive" strategies), not in
+    the surrounding pandas/numpy bookkeeping. Each shift's work is otherwise
+    independent of every other shift, so this function is factored out to be
+    run in parallel across shifts (see `run_retraining_experiment`) instead
+    of sequentially, which is the actual fix for the profiled hotspot.
+    """
+    shift_dt = shift_row['datetime_utc']
+
+    # Find shift index in df
+    time_diff = (df['datetime_utc'] - shift_dt).abs()
+    shift_idx = time_diff.idxmin()
+
+    # Evaluation window: EVAL_HORIZON bars after shift
+    eval_end = min(len(df), shift_idx + EVAL_HORIZON)
+    if eval_end - shift_idx < 30:
+        return None
+
+    eval_data = df.iloc[shift_idx:eval_end]
+    X_eval = eval_data[feature_cols].values
+    y_eval = eval_data['target_return'].values
+
+    # Pre-shift baseline MAE (30 bars before shift)
+    pre_start = max(0, shift_idx - ROLLING_WINDOW)
+    pre_data = df.iloc[pre_start:shift_idx]
+    X_pre = pre_data[feature_cols].values
+    y_pre = pre_data['target_return'].values
+    pre_pred = base_model.predict(X_pre)
+    pre_shift_mae = mean_absolute_error(y_pre, pre_pred)
+
+    # --- Strategy A: No retraining ---
+    pred_none = base_model.predict(X_eval)
+    mae_none = mean_absolute_error(y_eval, pred_none)
+    rolling_none = pd.Series(np.abs(y_eval - pred_none)).rolling(ROLLING_WINDOW).mean()
+    recovery_none = compute_recovery_time(rolling_none.values, pre_shift_mae)
+
+    # --- Strategy B: Full retrain ---
+    model_full = retrain_full(df, feature_cols, shift_idx, pair_params)
+    pred_full = model_full.predict(X_eval)
+    mae_full = mean_absolute_error(y_eval, pred_full)
+    rolling_full = pd.Series(np.abs(y_eval - pred_full)).rolling(ROLLING_WINDOW).mean()
+    recovery_full = compute_recovery_time(rolling_full.values, pre_shift_mae)
+
+    # --- Strategy C: Window retrain (30 days) ---
+    model_window = retrain_window(df, feature_cols, shift_idx, WINDOW_SIZE, pair_params)
+    pred_window = model_window.predict(X_eval)
+    mae_window = mean_absolute_error(y_eval, pred_window)
+    rolling_window = pd.Series(np.abs(y_eval - pred_window)).rolling(ROLLING_WINDOW).mean()
+    recovery_window = compute_recovery_time(rolling_window.values, pre_shift_mae)
+
+    # --- Strategy D: Weighted retrain ---
+    model_weighted = retrain_weighted(df, feature_cols, shift_idx, pair_params)
+    pred_weighted = model_weighted.predict(X_eval)
+    mae_weighted = mean_absolute_error(y_eval, pred_weighted)
+    rolling_weighted = pd.Series(np.abs(y_eval - pred_weighted)).rolling(ROLLING_WINDOW).mean()
+    recovery_weighted = compute_recovery_time(rolling_weighted.values, pre_shift_mae)
+
+    # --- Strategy E: Adaptive retrain (uses shift type + attribution) ---
+    model_adaptive, adaptive_cols, adaptive_policy = retrain_adaptive(
+        df, feature_cols, shift_idx, pair_params, shift_row
+    )
+    pred_adaptive = model_adaptive.predict(eval_data[adaptive_cols].values)
+    mae_adaptive = mean_absolute_error(y_eval, pred_adaptive)
+    rolling_adaptive = pd.Series(np.abs(y_eval - pred_adaptive)).rolling(ROLLING_WINDOW).mean()
+    recovery_adaptive = compute_recovery_time(rolling_adaptive.values, pre_shift_mae)
+
+    return {
+        'shift_datetime': str(shift_dt),
+        'shift_type': shift_row.get('type', 'unknown'),
+        'dominant_group': shift_row.get('dominant_group', 'unknown'),
+        'adaptive_policy': adaptive_policy,
+        'pre_shift_mae': round(pre_shift_mae, 6),
+        # No retrain
+        'mae_no_retrain': round(mae_none, 6),
+        'recovery_no_retrain': recovery_none,
+        # Full
+        'mae_full_retrain': round(mae_full, 6),
+        'recovery_full_retrain': recovery_full,
+        # Window
+        'mae_window_retrain': round(mae_window, 6),
+        'recovery_window_retrain': recovery_window,
+        # Weighted
+        'mae_weighted_retrain': round(mae_weighted, 6),
+        'recovery_weighted_retrain': recovery_weighted,
+        # Adaptive
+        'mae_adaptive_retrain': round(mae_adaptive, 6),
+        'recovery_adaptive_retrain': recovery_adaptive,
+    }
+
+
+def run_retraining_experiment(pair_name: str, *, n_jobs: int = -1) -> pd.DataFrame | None:
+    """Run all 5 strategies on detected shifts for one pair.
+
+    `n_jobs` controls how many shifts are processed in parallel (passed to
+    `joblib.Parallel`); `-1` uses all available cores, `1` reproduces the
+    original sequential behavior (useful for debugging or profiling).
+    """
     print(f"\n{'='*60}")
     print(f"Selective Retraining — {pair_name}")
     print(f"{'='*60}")
@@ -339,96 +445,18 @@ def run_retraining_experiment(pair_name: str) -> pd.DataFrame | None:
         print("  No high-severity shifts in test period. Skipping.")
         return None
 
-    all_results = []
-
-    for shift_num, (_, shift_row) in enumerate(shifts.iterrows()):
-        shift_dt = shift_row['datetime_utc']
-
-        # Find shift index in df
-        time_diff = (df['datetime_utc'] - shift_dt).abs()
-        shift_idx = time_diff.idxmin()
-
-        # Evaluation window: EVAL_HORIZON bars after shift
-        eval_end = min(len(df), shift_idx + EVAL_HORIZON)
-        if eval_end - shift_idx < 30:
-            continue
-
-        eval_data = df.iloc[shift_idx:eval_end]
-        X_eval = eval_data[feature_cols].values
-        y_eval = eval_data['target_return'].values
-
-        # Pre-shift baseline MAE (30 bars before shift)
-        pre_start = max(0, shift_idx - ROLLING_WINDOW)
-        pre_data = df.iloc[pre_start:shift_idx]
-        X_pre = pre_data[feature_cols].values
-        y_pre = pre_data['target_return'].values
-        pre_pred = base_model.predict(X_pre)
-        pre_shift_mae = mean_absolute_error(y_pre, pre_pred)
-
-        # --- Strategy A: No retraining ---
-        pred_none = base_model.predict(X_eval)
-        mae_none = mean_absolute_error(y_eval, pred_none)
-        rolling_none = pd.Series(np.abs(y_eval - pred_none)).rolling(ROLLING_WINDOW).mean()
-        recovery_none = compute_recovery_time(rolling_none.values, pre_shift_mae)
-
-        # --- Strategy B: Full retrain ---
-        model_full = retrain_full(df, feature_cols, shift_idx, pair_params)
-        pred_full = model_full.predict(X_eval)
-        mae_full = mean_absolute_error(y_eval, pred_full)
-        rolling_full = pd.Series(np.abs(y_eval - pred_full)).rolling(ROLLING_WINDOW).mean()
-        recovery_full = compute_recovery_time(rolling_full.values, pre_shift_mae)
-
-        # --- Strategy C: Window retrain (30 days) ---
-        model_window = retrain_window(df, feature_cols, shift_idx, WINDOW_SIZE, pair_params)
-        pred_window = model_window.predict(X_eval)
-        mae_window = mean_absolute_error(y_eval, pred_window)
-        rolling_window = pd.Series(np.abs(y_eval - pred_window)).rolling(ROLLING_WINDOW).mean()
-        recovery_window = compute_recovery_time(rolling_window.values, pre_shift_mae)
-
-        # --- Strategy D: Weighted retrain ---
-        model_weighted = retrain_weighted(df, feature_cols, shift_idx, pair_params)
-        pred_weighted = model_weighted.predict(X_eval)
-        mae_weighted = mean_absolute_error(y_eval, pred_weighted)
-        rolling_weighted = pd.Series(np.abs(y_eval - pred_weighted)).rolling(ROLLING_WINDOW).mean()
-        recovery_weighted = compute_recovery_time(rolling_weighted.values, pre_shift_mae)
-
-        # --- Strategy E: Adaptive retrain (uses shift type + attribution) ---
-        model_adaptive, adaptive_cols, adaptive_policy = retrain_adaptive(
-            df, feature_cols, shift_idx, pair_params, shift_row
-        )
-        pred_adaptive = model_adaptive.predict(eval_data[adaptive_cols].values)
-        mae_adaptive = mean_absolute_error(y_eval, pred_adaptive)
-        rolling_adaptive = pd.Series(np.abs(y_eval - pred_adaptive)).rolling(ROLLING_WINDOW).mean()
-        recovery_adaptive = compute_recovery_time(rolling_adaptive.values, pre_shift_mae)
-
-        result = {
-            'shift_datetime': str(shift_dt),
-            'shift_type': shift_row.get('type', 'unknown'),
-            'dominant_group': shift_row.get('dominant_group', 'unknown'),
-            'adaptive_policy': adaptive_policy,
-            'pre_shift_mae': round(pre_shift_mae, 6),
-            # No retrain
-            'mae_no_retrain': round(mae_none, 6),
-            'recovery_no_retrain': recovery_none,
-            # Full
-            'mae_full_retrain': round(mae_full, 6),
-            'recovery_full_retrain': recovery_full,
-            # Window
-            'mae_window_retrain': round(mae_window, 6),
-            'recovery_window_retrain': recovery_window,
-            # Weighted
-            'mae_weighted_retrain': round(mae_weighted, 6),
-            'recovery_weighted_retrain': recovery_weighted,
-            # Adaptive
-            'mae_adaptive_retrain': round(mae_adaptive, 6),
-            'recovery_adaptive_retrain': recovery_adaptive,
-        }
-        all_results.append(result)
-
-        if (shift_num + 1) % 5 == 0 or shift_num == 0:
-            print(f"  [{shift_num+1}/{len(shifts)}] {shift_dt.date()} | "
-                  f"No:{mae_none:.5f} Full:{mae_full:.5f} "
-                  f"Win:{mae_window:.5f} Wgt:{mae_weighted:.5f} Adp:{mae_adaptive:.5f}")
+    # Each shift's 5-strategy retraining pass is independent of every other
+    # shift, and XGBoost's own fit() dominates the per-shift cost (see
+    # _process_one_shift docstring), so this is where parallelism actually
+    # pays off instead of racing to optimize the pandas bookkeeping around it.
+    shift_rows = [row for _, row in shifts.iterrows()]
+    processed = Parallel(n_jobs=n_jobs, prefer='processes')(
+        delayed(_process_one_shift)(df, feature_cols, pair_params, base_model, shift_row)
+        for shift_row in shift_rows
+    )
+    all_results = [result for result in processed if result is not None]
+    all_results.sort(key=lambda result: result['shift_datetime'])
+    print(f"  Processed {len(all_results)}/{len(shifts)} shifts (n_jobs={n_jobs})")
 
     results_df = pd.DataFrame(all_results)
 
@@ -473,11 +501,17 @@ def run_retraining_experiment(pair_name: str) -> pd.DataFrame | None:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--pairs", nargs="+", default=['EURUSD', 'GBPJPY', 'XAUUSD'])
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=-1,
+        help="Parallel workers for per-shift retraining (-1 = all cores, 1 = sequential/original behavior).",
+    )
     args = parser.parse_args()
 
     all_summaries = {}
     for pair in args.pairs:
-        result = run_retraining_experiment(pair)
+        result = run_retraining_experiment(pair, n_jobs=args.n_jobs)
         if result:
             _, summary = result
             all_summaries[pair] = summary
