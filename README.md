@@ -263,6 +263,40 @@ python src/analysis/walkforward_report.py --pairs EURUSD GBPJPY XAUUSD
 
 This writes comparison tables to `results/walkforward/` and figures to `results/figures/`.
 
+## Performance Profiling
+
+Profiling the reported pipeline with `cProfile` (`scripts/profile_retraining.py`) showed that
+`src/retraining/selective.py`'s selective-retraining step was the most expensive part of a full
+run, and that **>98% of its wall-clock time was spent inside XGBoost's own `fit`/`train`/`update`
+internals**, not in the surrounding pandas/numpy bookkeeping. Concretely, for every detected shift
+the original code retrained XGBoost from scratch under 5 policies (no retrain / full / window /
+weighted / adaptive), one shift at a time, even though each shift's retraining work is completely
+independent of every other shift's.
+
+**Fix:** the per-shift work was factored into `_process_one_shift` and is now run in parallel
+across shifts with `joblib.Parallel` (`prefer="processes"`, since XGBoost's internal thread pools
+oversubscribe with a `threading` backend). On an 8-core machine this cut EURUSD's retraining
+wall-clock time from **146.4s to 88.2s (1.7x)**, with byte-for-byte identical MAE and recovery
+results (verified by diffing `results/retraining/EURUSD_retraining_results.csv` before/after).
+`run_retraining_experiment(pair, n_jobs=1)` reproduces the original sequential behavior for
+debugging or re-profiling.
+
+```bash
+python scripts/profile_retraining.py --pair EURUSD
+python scripts/profile_retraining.py --pair EURUSD --n-jobs 1  # compare against sequential
+```
+
+## Model Tuning
+
+The monitored model's hyperparameters (`learning_rate`, `max_depth`, `n_estimators`, `reg_alpha`,
+`reg_lambda`) are selected per pair via grid search with a 5-fold `TimeSeriesSplit` (see
+`project_report.tex`, Section 3.3, "Monitored Model and Baselines"). This is classical **XGBoost
+hyperparameter tuning** -- a grid search over a fixed set of boosting/regularization parameters --
+not LLM fine-tuning; ShiftGuard doesn't train or fine-tune any language model. EURUSD, GBPJPY, and
+XAUUSD each end up with different tuned configurations (e.g. EURUSD: depth 5 / lr 0.05; GBPJPY:
+depth 3 / lr 0.01), which is evidence the search is actually running per pair rather than reusing
+one copied configuration.
+
 ## Adaptive Logic
 
 ShiftGuard is moving toward an **adaptive policy system**, not just a detector.
